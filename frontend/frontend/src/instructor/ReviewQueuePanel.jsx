@@ -32,15 +32,23 @@ export default function ReviewQueuePanel({
 
         return String(item.assignmentRunId || '') === String(selectedAssignmentRunId)
       })
-      .map((item) => ({
-        ...item,
-        analysisState: normalizeAnalysisState(item.analysisState),
-        displayStudentName: getDisplayStudentName(item.studentName, item.id),
-        fullStudentName: String(item.studentName || '').trim() || `Student ${item.id}`,
-        submissionReference: item.publicId || `#${item.id}`,
-        compactSubmissionReference: compactOpaqueIdentifier(item.publicId || `#${item.id}`),
-        repositoryLabel: item.repositoryLabel || 'Course Repository',
-      }))
+      .map((item) => {
+        const displayStudentName = getDisplayStudentName(item.studentName)
+        const submissionReference = item.publicId || `#${item.id}`
+
+        return {
+          ...item,
+          analysisState: normalizeAnalysisState(item.analysisState),
+          displayStudentName,
+          fullStudentName:
+            displayStudentName === 'Name unavailable'
+              ? `Name unavailable for submission #${item.id}`
+              : displayStudentName,
+          submissionReference,
+          compactSubmissionReference: compactOpaqueIdentifier(submissionReference),
+          repositoryLabel: item.repositoryLabel || 'Course Repository',
+        }
+      })
   }, [selectedAssignmentRunId, selectedCourse, submissions])
 
   const availableLanguages = useMemo(() => {
@@ -115,6 +123,14 @@ export default function ReviewQueuePanel({
     if (!selectedSubmission) return
     if (normalizeAnalysisState(selectedSubmission.analysisState) !== 'complete') return
     navigate(`/report/${selectedSubmission.id}`)
+  }
+
+  const handleRowDoubleClick = (item) => {
+    setSelectedId(item.id)
+
+    if (normalizeAnalysisState(item.analysisState) !== 'complete') return
+
+    navigate(`/report/${item.id}`)
   }
 
   return (
@@ -259,6 +275,12 @@ export default function ReviewQueuePanel({
                             key={item.id}
                             className={selectedSubmission?.id === item.id ? 'reviewRowActive' : ''}
                             onClick={() => setSelectedId(item.id)}
+                            onDoubleClick={() => handleRowDoubleClick(item)}
+                            title={
+                              normalizeAnalysisState(item.analysisState) === 'complete'
+                                ? 'Double-click to open the full report'
+                                : 'Select this submission'
+                            }
                           >
                             <td>
                               <div

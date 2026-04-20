@@ -72,9 +72,21 @@ export function compactOpaqueIdentifier(value = '', startLength = 12, endLength 
   return `${normalized.slice(0, startLength)}...${normalized.slice(-endLength)}`
 }
 
-export function getDisplayStudentName(studentName, fallbackId) {
+export function getDisplayStudentName(studentName) {
   const normalizedStudentName = String(studentName || '').trim()
-  return compactOpaqueIdentifier(normalizedStudentName) || `Student ${fallbackId}`
+
+  if (!normalizedStudentName) {
+    return 'Name unavailable'
+  }
+
+  if (
+    looksOpaqueIdentifier(normalizedStudentName) ||
+    /^student\s+#?\d+$/i.test(normalizedStudentName)
+  ) {
+    return 'Name unavailable'
+  }
+
+  return normalizedStudentName
 }
 
 export function getSimilarityBand(score = 0) {

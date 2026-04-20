@@ -1,4 +1,5 @@
 import { supabase } from '../lib/supabase'
+import { fetchDecryptedUserInfo } from '../lib/analysisApi'
 import {
   getMockSubmissionComparison,
   getMockSubmissionReport,
@@ -53,12 +54,69 @@ function buildSubmissionReference(submissionRow, fallbackId) {
   return getSubmissionPublicId(submissionRow) || `Submission #${fallbackId}`
 }
 
-function mapUserName(submissionRow, fallbackId) {
-  return (
-    parseStudentNameFromFolderPath(submissionRow?.folder_path) ||
-    getSubmissionPublicId(submissionRow) ||
-    `Student ${fallbackId}`
+function mapUserName(submissionRow) {
+  return parseStudentNameFromFolderPath(submissionRow?.folder_path)
+}
+
+function buildStudentNameFromUserInfo(userInfo) {
+  const firstName = String(userInfo?.firstName || userInfo?.first || '').trim()
+  const lastName = String(userInfo?.lastName || userInfo?.last || '').trim()
+
+  return [firstName, lastName].filter(Boolean).join(' ').trim()
+}
+
+function hasEncryptedUserInfo(submissionRow) {
+  return Boolean(
+    String(submissionRow?.student_first_name_enc || '').trim() ||
+      String(submissionRow?.student_last_name_enc || '').trim() ||
+      String(submissionRow?.student_email_enc || '').trim()
   )
+}
+
+function getStudentSubmissions(submissions = []) {
+  return submissions.filter((submission) => hasEncryptedUserInfo(submission))
+}
+
+async function loadUserInfoBySubmissionRows(submissionRows = []) {
+  const candidates = submissionRows.filter(
+    (row) => row?.submission_id && hasEncryptedUserInfo(row)
+  )
+
+  if (!candidates.length) {
+    return new Map()
+  }
+
+  try {
+    const entries = []
+
+    for (const submission of candidates) {
+      try {
+        const userInfo = await fetchDecryptedUserInfo({
+          firstName: submission.student_first_name_enc,
+          lastName: submission.student_last_name_enc,
+          email: submission.student_email_enc,
+        })
+
+        if (userInfo) {
+          entries.push([String(submission.submission_id), userInfo])
+        }
+      } catch (error) {
+        console.warn(
+          'Student names could not be loaded from the backend user info endpoint.',
+          error
+        )
+
+        if (error?.status === 404) {
+          break
+        }
+      }
+    }
+
+    return new Map(entries)
+  } catch (error) {
+    console.warn('Student names could not be loaded from the backend user info endpoint.', error)
+    return new Map()
+  }
 }
 
 function getReviewStatus(score) {
@@ -307,8 +365,8 @@ function buildRepositoryLabel(submissionRow) {
   return submissionRow?.repository_id ? DEFAULT_REPOSITORY_LABEL : 'Code File'
 }
 
-function buildSourceLabel(submissionRow, submissionId) {
-  const studentName = mapUserName(submissionRow, submissionId)
+function buildSourceLabel(submissionRow, submissionId, userInfo = null) {
+  const studentName = buildStudentNameFromUserInfo(userInfo) || mapUserName(submissionRow, submissionId)
   return studentName ? `${studentName} (Submission #${submissionId})` : `Submission #${submissionId}`
 }
 
@@ -881,7 +939,7 @@ async function loadCourseSubmissionDataset(courseId) {
 
   const { data: submissionRows, error: submissionsError } = await supabase
     .from('submissions')
-    .select('submission_id, public_id, created_at, repository_id, folder_path')
+    .select('submission_id, public_id, student_first_name_enc, student_last_name_enc, student_email_enc, created_at, repository_id, folder_path')
     .in('repository_id', repositoryIds)
     .order('created_at', { ascending: false })
 
@@ -900,7 +958,7 @@ async function loadSubmissionsByIds(submissionIds) {
 
   const { data, error } = await supabase
     .from('submissions')
-    .select('submission_id, public_id, created_at, repository_id, folder_path')
+    .select('submission_id, public_id, student_first_name_enc, student_last_name_enc, student_email_enc, created_at, repository_id, folder_path')
     .in('submission_id', submissionIds)
 
   if (error) throw error
@@ -1396,15 +1454,16 @@ export async function fetchReviewQueue(courseId) {
     ensureSupabase()
 
     const { assignmentMap, repositoriesMap, submissions } = await loadCourseSubmissionDataset(courseId)
+    const studentSubmissions = getStudentSubmissions(submissions)
 
-    if (!submissions.length) {
+    if (!studentSubmissions.length) {
       return { submissions: [] }
     }
     let resultsMap = new Map()
 
     try {
       resultsMap = await loadResultsBySubmissionIds(
-        unique(submissions.map((row) => row.submission_id))
+        unique(studentSubmissions.map((row) => row.submission_id))
       )
     } catch (resultsError) {
       console.warn(
@@ -1413,10 +1472,13 @@ export async function fetchReviewQueue(courseId) {
       )
     }
 
+    const userInfoMap = await loadUserInfoBySubmissionRows(studentSubmissions)
+
     return {
-      submissions: submissions.map((submission) => {
+      submissions: studentSubmissions.map((submission) => {
         const repository = repositoriesMap.get(String(submission.repository_id))
         const assignment = assignmentMap.get(String(repository?.assignment_run_id))
+        const userInfo = userInfoMap.get(String(submission.submission_id))
         const bestResult = pickBestResult(resultsMap.get(String(submission.submission_id)) || [])
         const similarityScore = Number.isFinite(Number(bestResult?.score))
           ? Number(bestResult.score)
@@ -1426,7 +1488,9 @@ export async function fetchReviewQueue(courseId) {
           id: submission.submission_id,
           publicId: getSubmissionPublicId(submission),
           submissionLabel: buildSubmissionReference(submission, submission.submission_id),
-          studentName: mapUserName(submission, submission.submission_id),
+          studentName:
+            buildStudentNameFromUserInfo(userInfo) ||
+            mapUserName(submission, submission.submission_id),
           assignmentRunId: String(repository?.assignment_run_id || ''),
           assignmentName: assignment?.name || `Assignment #${repository?.assignment_run_id || submission.repository_id}`,
           language: assignment?.language || 'Unknown',
@@ -1455,12 +1519,13 @@ export async function fetchAnalytics(courseId) {
 
     const { assignments, assignmentMap, repositoriesMap, submissions } =
       await loadCourseSubmissionDataset(courseId)
-    const totalSubmissions = submissions.length
+    const studentSubmissions = getStudentSubmissions(submissions)
+    const totalSubmissions = studentSubmissions.length
     let resultsMap = new Map()
 
     try {
       resultsMap = await loadResultsBySubmissionIds(
-        unique(submissions.map((row) => row.submission_id))
+        unique(studentSubmissions.map((row) => row.submission_id))
       )
     } catch (resultsError) {
       console.warn(
@@ -1469,7 +1534,7 @@ export async function fetchAnalytics(courseId) {
       )
     }
 
-    const queueLikeSubmissions = submissions.map((submission) => {
+    const queueLikeSubmissions = studentSubmissions.map((submission) => {
       const repository = repositoriesMap.get(String(submission.repository_id))
       const assignment = assignmentMap.get(String(repository?.assignment_run_id))
       const bestResult = pickBestResult(resultsMap.get(String(submission.submission_id)) || [])
@@ -1549,6 +1614,11 @@ export async function fetchSubmissionReport(submissionId) {
       submissionResults.map((row) => getCounterpartSubmissionId(row, submissionId))
     )
     const sourceSubmissionsMap = await loadSubmissionsByIds(sourceSubmissionIds)
+    const userInfoMap = await loadUserInfoBySubmissionRows([
+      submission,
+      ...Array.from(sourceSubmissionsMap.values()),
+    ])
+    const userInfo = userInfoMap.get(String(submission.submission_id))
     const assignment = assignmentRunsMap.get(String(repository?.assignment_run_id))
     const bestScore = Number.isFinite(Number(submissionResults[0]?.score))
       ? Number(submissionResults[0].score)
@@ -1560,7 +1630,9 @@ export async function fetchSubmissionReport(submissionId) {
       id: submission.submission_id,
       publicId: getSubmissionPublicId(submission),
       submissionLabel: buildSubmissionReference(submission, submission.submission_id),
-      studentName: mapUserName(submission, submission.submission_id),
+      studentName:
+        buildStudentNameFromUserInfo(userInfo) ||
+        mapUserName(submission, submission.submission_id),
       assignmentName: assignment?.name || fallbackAssignmentName,
       language: assignment?.language || 'Unknown',
       submittedAt: formatShortTimestamp(submission.created_at),
@@ -1576,7 +1648,11 @@ export async function fetchSubmissionReport(submissionId) {
       matches: submissionResults.slice(0, 5).map((resultRow) => {
         const sourceSubmissionId = getCounterpartSubmissionId(resultRow, submissionId)
         const sourceSubmission = sourceSubmissionsMap.get(String(sourceSubmissionId))
-        const sourceLabel = buildSourceLabel(sourceSubmission, sourceSubmissionId)
+        const sourceLabel = buildSourceLabel(
+          sourceSubmission,
+          sourceSubmissionId,
+          userInfoMap.get(String(sourceSubmissionId))
+        )
 
         return {
           pairId: resultRow.pair_id,
@@ -1630,6 +1706,11 @@ export async function fetchSubmissionComparison(submissionId, options = {}) {
 
     const resultsMap = await loadResultsBySubmissionIds([submissionId])
     const candidateResults = resultsMap.get(String(submissionId)) || []
+    const currentUserInfoMap = await loadUserInfoBySubmissionRows([submission])
+    const currentUserInfo = currentUserInfoMap.get(String(submission.submission_id))
+    const currentStudentName =
+      buildStudentNameFromUserInfo(currentUserInfo) ||
+      mapUserName(submission, submission.submission_id)
     const bestResult =
       candidateResults.find((row) => String(row.pair_id || '') === requestedPairId) ||
       pickBestResult(candidateResults)
@@ -1638,6 +1719,8 @@ export async function fetchSubmissionComparison(submissionId, options = {}) {
       return {
         id: submission.submission_id,
         publicId: getSubmissionPublicId(submission),
+        submissionLabel: buildSubmissionReference(submission, submission.submission_id),
+        studentName: currentStudentName,
         assignmentRunId,
         repositoryOptions,
         defaultRepositoryId: String(defaultRepositoryOption?.repository_id || ''),
@@ -1662,7 +1745,12 @@ export async function fetchSubmissionComparison(submissionId, options = {}) {
     ])
 
     const sourceSubmission = sourceSubmissionMap.get(String(sourceSubmissionId))
-    const sourceLabel = buildSourceLabel(sourceSubmission, sourceSubmissionId)
+    const userInfoMap = await loadUserInfoBySubmissionRows([sourceSubmission].filter(Boolean))
+    const sourceLabel = buildSourceLabel(
+      sourceSubmission,
+      sourceSubmissionId,
+      userInfoMap.get(String(sourceSubmissionId))
+    )
     const sections = orientSectionsForSubmission(rawSections, bestResult, submissionId)
 
     const [leftText, rightText] = await Promise.all([
@@ -1683,6 +1771,8 @@ export async function fetchSubmissionComparison(submissionId, options = {}) {
     return {
       id: submission.submission_id,
       publicId: getSubmissionPublicId(submission),
+      submissionLabel: buildSubmissionReference(submission, submission.submission_id),
+      studentName: currentStudentName,
       assignmentRunId,
       repositoryOptions,
       defaultRepositoryId: String(defaultRepositoryOption?.repository_id || ''),
@@ -1758,7 +1848,7 @@ async function fetchExportData(assignmentRunId) {
 
   const { data: submissionRows, error: submissionsError } = await supabase
     .from('submissions')
-    .select('submission_id, public_id, created_at, repository_id, folder_path')
+    .select('submission_id, public_id, student_first_name_enc, student_last_name_enc, student_email_enc, created_at, repository_id, folder_path')
     .in('repository_id', repositoryIds)
     .order('created_at', { ascending: true })
 

@@ -8,6 +8,7 @@ import {
   buildComparisonViewModel,
   extractComparisonFileLabel,
   formatAnalysisStateLabel,
+  getDisplayStudentName,
   normalizeAnalysisState,
   parseStructuredSourceFiles,
 } from './utils'
@@ -47,6 +48,8 @@ const MATCH_PALETTE = [
   'rgba(255, 138, 128, 0.35)',
   'rgba(128, 203, 196, 0.35)',
 ]
+
+const COMPARISON_DATA_VERSION = 'student-name-lookup-v2'
 
 function findBlockIndex(lineNumber, matchedBlocks, side) {
   for (let index = 0; index < matchedBlocks.length; index += 1) {
@@ -236,6 +239,9 @@ export default function SubmissionComparePage() {
   useEffect(() => {
     let ignore = false
 
+    setLoading(true)
+    setError('')
+
     fetchSubmissionComparison(submissionId, { pairId })
       .then((data) => {
         if (!ignore) {
@@ -262,7 +268,7 @@ export default function SubmissionComparePage() {
     return () => {
       ignore = true
     }
-  }, [pairId, submissionId])
+  }, [pairId, submissionId, COMPARISON_DATA_VERSION])
 
   const leftFiles = useMemo(
     () =>
@@ -416,6 +422,11 @@ export default function SubmissionComparePage() {
         repositorySource?.repositoryName ||
         'Select a repository'
       : 'Matched Submission'
+  const submissionDisplayName = getDisplayStudentName(
+    comparison?.studentName,
+    comparison?.id || submissionId
+  )
+  const submissionReference = `Submission #${comparison?.id || submissionId}`
 
   const leftRenderedRows = useMemo(
     () =>
@@ -493,11 +504,11 @@ export default function SubmissionComparePage() {
 
           <div className="teacherStatGrid">
             <div className="teacherStatCard">
-              <p className="teacherStatLabel">Submission ID</p>
+              <p className="teacherStatLabel">Student</p>
               <h3 className="teacherStatValue compareLongValue">
-                {comparison.publicId || `#${comparison.id}`}
+                {submissionDisplayName}
               </h3>
-              <p className="teacherStatNote">{leftFileLabel}</p>
+              <p className="teacherStatNote">{submissionReference}</p>
             </div>
             <div className="teacherStatCard">
               <p className="teacherStatLabel">

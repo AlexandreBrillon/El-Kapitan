@@ -16,6 +16,12 @@ const repositoryEndpointPath = String(
   import.meta.env.VITE_REPOSITORY_ENDPOINT || '/repository'
 ).trim()
 
+const userInfoEndpointPath = String(
+  import.meta.env.VITE_USERINFO_ENDPOINT || '/userinfo'
+).trim()
+
+let userInfoEndpointUnavailable = false
+
 function buildBackendUrl(path, missingMessage) {
   if (!backendApiBaseUrl) {
     throw new Error(missingMessage)
@@ -204,5 +210,57 @@ export async function uploadRepositorySourceToBackend({
   return {
     ...payload,
     message,
+  }
+}
+
+export async function fetchDecryptedUserInfo({ firstName, lastName, email }) {
+  const hasEncryptedValue = [firstName, lastName, email].some((value) =>
+    String(value || '').trim()
+  )
+
+  if (!hasEncryptedValue || userInfoEndpointUnavailable) {
+    return null
+  }
+
+  const formData = new FormData()
+  formData.append('firstName', String(firstName || '').trim())
+  // Some backend builds use the original typo from the shared endpoint snippet.
+  formData.append('firstNme', String(firstName || '').trim())
+  formData.append('lastName', String(lastName || '').trim())
+  formData.append('email', String(email || '').trim())
+
+  let response
+
+  try {
+    response = await fetch(
+      buildBackendUrl(
+        userInfoEndpointPath,
+        'Missing VITE_ANALYSIS_API_BASE_URL. Add the backend URL before loading student names.'
+      ),
+      {
+        method: 'POST',
+        body: formData,
+      }
+    )
+  } catch {
+    throw new Error(buildNetworkErrorMessage())
+  }
+
+  const payload = await parseAnalysisResponse(response)
+
+  if (!response.ok) {
+    if (response.status === 404) {
+      userInfoEndpointUnavailable = true
+    }
+
+    const error = new Error(buildTextMessage(payload, 'Failed to load student names.'))
+    error.status = response.status
+    throw error
+  }
+
+  return {
+    firstName: String(payload.firstName || payload.first || '').trim(),
+    lastName: String(payload.lastName || payload.last || '').trim(),
+    email: String(payload.email || payload.mail || '').trim(),
   }
 }
