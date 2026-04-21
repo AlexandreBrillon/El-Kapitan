@@ -49,7 +49,6 @@ const MATCH_PALETTE = [
   'rgba(128, 203, 196, 0.35)',
 ]
 
-const COMPARISON_DATA_VERSION = 'student-name-lookup-v2'
 
 function findBlockIndex(lineNumber, matchedBlocks, side) {
   for (let index = 0; index < matchedBlocks.length; index += 1) {
@@ -224,7 +223,7 @@ export default function SubmissionComparePage() {
   const [comparison, setComparison] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
-  const [viewMode, setViewMode] = useState('focus')
+  const [viewMode, setViewMode] = useState('full')
   const [activeBlockIndex, setActiveBlockIndex] = useState(0)
   const [hoveredBlockIndex, setHoveredBlockIndex] = useState(-1)
   const [selectedLeftFileId, setSelectedLeftFileId] = useState('')
@@ -239,8 +238,6 @@ export default function SubmissionComparePage() {
   useEffect(() => {
     let ignore = false
 
-    setLoading(true)
-    setError('')
 
     fetchSubmissionComparison(submissionId, { pairId })
       .then((data) => {
@@ -268,7 +265,7 @@ export default function SubmissionComparePage() {
     return () => {
       ignore = true
     }
-  }, [pairId, submissionId, COMPARISON_DATA_VERSION])
+  }, [pairId, submissionId])
 
   const leftFiles = useMemo(
     () =>
@@ -561,7 +558,7 @@ export default function SubmissionComparePage() {
                     onClick={() => setViewMode('focus')}
                     disabled={!matchedBlockCount}
                   >
-                    Matched Sections
+                    Matched Sections Only
                   </button>
                   <button
                     className={viewMode === 'full' ? 'compareToggleButton active' : 'compareToggleButton'}
@@ -658,7 +655,7 @@ export default function SubmissionComparePage() {
                       row.type === 'gap' ? (
                         <div key={row.id} className="codeGap">
                           <span>...</span>
-                          <span>{row.hiddenCount} line(s) hidden</span>
+                          <span>{row.hiddenCount} unmatched line(s) hidden</span>
                         </div>
                       ) : (
                         <div
@@ -778,7 +775,7 @@ export default function SubmissionComparePage() {
                       row.type === 'gap' ? (
                         <div key={row.id} className="codeGap">
                           <span>...</span>
-                          <span>{row.hiddenCount} line(s) hidden</span>
+                          <span>{row.hiddenCount} unmatched line(s) hidden</span>
                         </div>
                       ) : (
                         <div

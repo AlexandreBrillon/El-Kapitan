@@ -435,36 +435,181 @@ function hasRenderableSourceExtension(fileName) {
   )
 }
 
-async function extractTextFromZipBlob(blob) {
-  const zip = await JSZip.loadAsync(blob)
-  const archiveFiles = Object.values(zip.files).filter((entry) => !entry.dir)
+function normalizeArchiveEntryName(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .replace(/\/+/g, '/')
+}
 
-  if (!archiveFiles.length) {
+function isZipArchivePath(fileName) {
+  return String(fileName || '').toLowerCase().endsWith('.zip')
+}
+
+function getRenderableExtension(fileName) {
+  const normalized = String(fileName || '').toLowerCase()
+  return Array.from(RENDERABLE_SOURCE_EXTENSIONS).find((extension) =>
+    normalized.endsWith(extension)
+  ) || ''
+}
+
+function getSubmissionCanonicalLabel(label) {
+  const normalizedLabel = normalizeArchiveEntryName(label)
+  const submissionMatch = normalizedLabel.match(/submission\s*0*(\d+)/i)
+
+  if (!submissionMatch?.[1]) {
     return ''
   }
 
-  const preferredFiles = archiveFiles.filter((entry) => hasRenderableSourceExtension(entry.name))
-  const candidateFiles = (preferredFiles.length ? preferredFiles : archiveFiles)
-    .sort((left, right) => left.name.localeCompare(right.name))
-    .slice(0, 12)
+  const extension = getRenderableExtension(normalizedLabel)
+  if (!extension) {
+    return ''
+  }
 
+  const number = submissionMatch[1].padStart(2, '0')
+  return `Submission${number}${extension}`
+}
+
+function scoreCanonicalSourceCandidate(file, canonicalLabel) {
+  const label = normalizeArchiveEntryName(file.label)
+  const fileName = getFileNameFromPath(label)
+  let score = 0
+
+  if (fileName.toLowerCase() === canonicalLabel.toLowerCase()) score += 1000
+  if (!label.toLowerCase().includes('.zip.')) score += 100
+  if (!/[0-9a-f]{8}-[0-9a-f-]{20,}/i.test(label)) score += 25
+
+  score -= label.split('/').length * 5
+  score -= label.length / 100
+
+  return score
+}
+
+function reduceSubmissionSourceDuplicates(files) {
+  const normalizedFiles = files
+    .map((file) => ({
+      label: normalizeArchiveEntryName(file.label),
+      text: String(file.text || '').replace(/\r\n/g, '\n'),
+    }))
+    .filter((file) => file.label && file.text.trim())
+
+  const submissionGroups = normalizedFiles.reduce((accumulator, file) => {
+    const canonicalLabel = getSubmissionCanonicalLabel(file.label)
+    if (!canonicalLabel) return accumulator
+
+    const existing = accumulator.get(canonicalLabel)
+    if (
+      !existing ||
+      scoreCanonicalSourceCandidate(file, canonicalLabel) >
+        scoreCanonicalSourceCandidate(existing, canonicalLabel)
+    ) {
+      accumulator.set(canonicalLabel, file)
+    }
+
+    return accumulator
+  }, new Map())
+
+  if (submissionGroups.size < 2) {
+    return normalizedFiles
+  }
+
+  return Array.from(submissionGroups.entries())
+    .sort(([leftLabel], [rightLabel]) => leftLabel.localeCompare(rightLabel))
+    .map(([canonicalLabel, file]) => ({
+      ...file,
+      label: canonicalLabel,
+    }))
+}
+
+function buildStructuredSourceText(files = []) {
+  const normalizedFiles = reduceSubmissionSourceDuplicates(files)
+
+  const fileNameCounts = normalizedFiles.reduce((accumulator, file) => {
+    const fileName = getFileNameFromPath(file.label)
+    accumulator.set(fileName, (accumulator.get(fileName) || 0) + 1)
+    return accumulator
+  }, new Map())
+
+  return normalizedFiles
+    .map((file) => {
+      const fileName = getFileNameFromPath(file.label)
+      const displayLabel = fileNameCounts.get(fileName) === 1 ? fileName : file.label
+      return `// File: ${displayLabel}\n${file.text}`
+    })
+    .join('\n\n')
+    .trim()
+}
+async function collectRenderableZipFiles(source, options = {}) {
+  const {
+    depth = 0,
+    fileLimit = 24,
+    prefix = '',
+  } = options
+  const zip = await JSZip.loadAsync(source)
+  const archiveFiles = Object.values(zip.files)
+    .filter((entry) => !entry.dir)
+    .sort((left, right) =>
+      normalizeArchiveEntryName(left.name).localeCompare(normalizeArchiveEntryName(right.name))
+    )
+
+  if (!archiveFiles.length || fileLimit <= 0) {
+    return []
+  }
+
+  const preferredFiles = archiveFiles.filter((entry) => {
+    const entryName = normalizeArchiveEntryName(entry.name)
+    return hasRenderableSourceExtension(entryName) || isZipArchivePath(entryName)
+  })
+  const candidateFiles = (preferredFiles.length ? preferredFiles : archiveFiles).slice(0, fileLimit)
   const renderedFiles = []
 
   for (const entry of candidateFiles) {
+    if (renderedFiles.length >= fileLimit) {
+      break
+    }
+
+    const entryName = normalizeArchiveEntryName(entry.name)
+    const entryLabel = prefix ? `${prefix}/${entryName}` : entryName
+
+    if (isZipArchivePath(entryName) && depth < 3) {
+      try {
+        const nestedArchive = await entry.async('arraybuffer')
+        const nestedFiles = await collectRenderableZipFiles(nestedArchive, {
+          depth: depth + 1,
+          fileLimit: fileLimit - renderedFiles.length,
+          prefix: entryLabel,
+        })
+
+        renderedFiles.push(...nestedFiles)
+
+        if (nestedFiles.length) {
+          continue
+        }
+      } catch {
+        // If a file only looks like a zip, fall through and try to read it as text.
+      }
+    }
+
     const text = (await entry.async('text')).replace(/\r\n/g, '\n')
 
-    if (looksBinaryContent(entry.name, text)) {
+    if (looksBinaryContent(entryLabel, text)) {
       continue
     }
 
-    renderedFiles.push(
-      candidateFiles.length > 1 ? `// File: ${entry.name}\n${text}` : text
-    )
+    renderedFiles.push({
+      label: entryLabel,
+      text,
+    })
   }
 
-  return renderedFiles.join('\n\n').trim()
+  return renderedFiles
 }
 
+async function extractTextFromZipBlob(blob) {
+  const renderedFiles = await collectRenderableZipFiles(blob)
+  return buildStructuredSourceText(renderedFiles)
+}
 function looksBinaryContent(objectPath, text) {
   if (!text) return true
   if (String(objectPath || '').toLowerCase().endsWith('.bin')) return true
@@ -473,10 +618,7 @@ function looksBinaryContent(objectPath, text) {
 }
 
 function normalizeStoragePath(objectPath) {
-  return String(objectPath || '')
-    .trim()
-    .replace(/^\/+/, '')
-    .replace(/\/+/g, '/')
+  return normalizeArchiveEntryName(objectPath)
 }
 
 function getParentStoragePrefix(objectPath) {
@@ -687,6 +829,75 @@ async function readStorageText(objectPath, bucket = 'Submissions') {
   return rendered.join('\n\n').trim()
 }
 
+async function discoverStorageSourcePaths(objectPath, bucket = 'Submissions') {
+  const normalizedPath = normalizeStoragePath(objectPath)
+  const prefixesToTry = unique([
+    normalizedPath,
+    getParentStoragePrefix(normalizedPath),
+  ]).filter(Boolean)
+
+  const discovered = []
+  for (const prefix of prefixesToTry) {
+    const listed = await listStorageFilesRecursively(prefix, 4, 80, bucket)
+    if (listed.length) discovered.push(...listed)
+  }
+
+  return unique(discovered)
+    .filter((candidatePath) => {
+      const normalizedCandidate = normalizeStoragePath(candidatePath)
+      const lowerCandidate = normalizedCandidate.toLowerCase()
+      const score = buildStorageCandidateScore(normalizedCandidate, normalizedPath)
+
+      return (
+        hasRenderableSourceExtension(normalizedCandidate) ||
+        isZipArchivePath(normalizedCandidate) ||
+        lowerCandidate.includes('.zip.')
+      ) && (
+        lowerCandidate.startsWith(normalizedPath.toLowerCase()) ||
+        score >= 20
+      )
+    })
+    .sort((left, right) => left.localeCompare(right))
+}
+
+async function readStorageSourceText(objectPath, bucket = 'Submissions') {
+  if (!objectPath) return ''
+
+  const normalizedPath = normalizeStoragePath(objectPath)
+  const directDownload = await supabase.storage.from(bucket).download(normalizedPath)
+
+  if (!directDownload.error && directDownload.data) {
+    const directText = await blobToRenderableText(directDownload.data, normalizedPath)
+    const directFiles = parseStructuredSourceFiles(directText, getFileNameFromPath(normalizedPath))
+
+    if (directFiles.length > 1) {
+      return buildStructuredSourceText(directFiles)
+    }
+  }
+
+  const candidates = await discoverStorageSourcePaths(objectPath, bucket)
+  const rendered = []
+
+  for (const candidatePath of candidates.slice(0, 40)) {
+    const { data: blob } = await supabase.storage.from(bucket).download(candidatePath)
+    if (!blob) continue
+
+    const text = await blobToRenderableText(blob, candidatePath)
+    if (!text) continue
+
+    if (text.trim().startsWith('// File:')) {
+      rendered.push(...parseStructuredSourceFiles(text, getFileNameFromPath(candidatePath)))
+      continue
+    }
+
+    rendered.push({
+      label: getFileNameFromPath(candidatePath),
+      text,
+    })
+  }
+
+  return rendered.length ? buildStructuredSourceText(rendered) : readStorageText(objectPath, bucket)
+}
 function parseStoredSections(text) {
   const normalizedText = String(text || '').trim()
 
@@ -1796,6 +2007,49 @@ export async function fetchSubmissionComparison(submissionId, options = {}) {
   }
 }
 
+function sanitizeRepositorySourceFiles(files = []) {
+  const normalizedFiles = files
+    .map((file) => ({
+      ...file,
+      label: normalizeArchiveEntryName(file?.label),
+      text: String(file?.text || '').replace(/\r\n/g, '\n'),
+    }))
+    .filter((file) => file.label && file.text.trim())
+
+  const reducedSubmissionFiles = reduceSubmissionSourceDuplicates(normalizedFiles)
+  const canonicalSubmissionCount = new Set(
+    reducedSubmissionFiles
+      .map((file) => getSubmissionCanonicalLabel(file.label))
+      .filter(Boolean)
+  ).size
+
+  const filesToUse =
+    canonicalSubmissionCount >= 2
+      ? reducedSubmissionFiles.filter((file) => getSubmissionCanonicalLabel(file.label))
+      : Array.from(
+          normalizedFiles.reduce((accumulator, file) => {
+            const key = getFileNameFromPath(file.label) || file.label
+            const existing = accumulator.get(key)
+
+            if (!existing || String(file.text || '').trim().length > String(existing.text || '').trim().length) {
+              accumulator.set(key, {
+                ...file,
+                label: key,
+              })
+            }
+
+            return accumulator
+          }, new Map()).values()
+        )
+
+  return filesToUse
+    .sort((left, right) => left.label.localeCompare(right.label))
+    .map((file, index) => ({
+      ...file,
+      id: `${index + 1}:${file.label}`,
+      index,
+    }))
+}
 export async function fetchRepositoryComparisonSource(repositoryId) {
   try {
     ensureSupabase()
@@ -1808,14 +2062,14 @@ export async function fetchRepositoryComparisonSource(repositoryId) {
     }
 
     const repositoryName = buildRepositoryName(repository)
-    const rawText = await readStorageText(repository.repository_path)
+    const rawText = await readStorageSourceText(repository.repository_path)
 
     return {
       repositoryId: String(repository.repository_id),
       repositoryName,
       repositoryPath: String(repository.repository_path || '').trim(),
       rawText,
-      files: parseStructuredSourceFiles(rawText, repositoryName),
+      files: sanitizeRepositorySourceFiles(parseStructuredSourceFiles(rawText, repositoryName)),
     }
   } catch (error) {
     console.error('Failed to load repository source for comparison.', error)
@@ -1862,23 +2116,8 @@ async function fetchExportData(assignmentRunId) {
   return { submissions, resultsMap }
 }
 
-function buildStudentFolderName(submissionRow) {
-  const publicId = getSubmissionPublicId(submissionRow)
-    .replace(/[^a-zA-Z0-9._-]/g, '_')
-    .trim()
-  if (publicId) return publicId
-
-  const fileName = String(submissionRow?.folder_path || '').split('/').filter(Boolean).pop()
-  if (!fileName) return null
-
-  const match = fileName.match(/^([^_]+)_([^_]+)_\d+_/)
-  if (!match) return null
-
-  return `${match[1]}_${match[2]}`.toLowerCase()
-}
-
 function getFileNameFromPath(folderPath) {
-  const segments = String(folderPath || '').split('/').filter(Boolean)
+  const segments = normalizeArchiveEntryName(folderPath).split('/').filter(Boolean)
   return segments.length ? segments[segments.length - 1] : 'submission'
 }
 

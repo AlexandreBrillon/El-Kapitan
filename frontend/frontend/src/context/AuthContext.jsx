@@ -5,7 +5,7 @@ import { AuthContext } from './auth-context'
 
 export function AuthProvider({ children }) {
   const [user, setUser] = useState(null)
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(() => Boolean(supabase))
 
   const resolveInstructorProfile = async (sessionUser) => {
     return buildFallbackProfile(sessionUser)
@@ -13,7 +13,6 @@ export function AuthProvider({ children }) {
 
   useEffect(() => {
     if (!supabase) {
-      setLoading(false)
       return
     }
 

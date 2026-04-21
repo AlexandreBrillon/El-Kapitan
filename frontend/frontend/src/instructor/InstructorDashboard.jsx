@@ -810,14 +810,14 @@ export default function InstructorDashboard() {
 
             {activeTab === 'review' && (
               <div className="toolbarFieldStack">
-                <label>Assignment Run</label>
+                <label>Assignment</label>
                 <select
                   className="teacherSelect"
                   value={selectedReviewAssignmentRunId}
                   onChange={handleReviewAssignmentSelectChange}
                   disabled={!selectedCourse || assignmentsLoading || assignments.length === 0}
                 >
-                  <option value="all">All assignment runs</option>
+                  <option value="all">All assignments</option>
                   {assignments.map((assignment) => (
                     <option
                       key={assignment.assignment_run_id}
