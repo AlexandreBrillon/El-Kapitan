@@ -1,10 +1,15 @@
 import { supabase } from '../lib/supabase'
+import { fetchDecryptedUserInfo } from '../lib/analysisApi'
 import {
   getMockSubmissionComparison,
   getMockSubmissionReport,
 } from './mockData'
 import JSZip from 'jszip'
-import { DEFAULT_REPOSITORY_LABEL, formatShortTimestamp } from './utils'
+import {
+  DEFAULT_REPOSITORY_LABEL,
+  formatShortTimestamp,
+  parseStructuredSourceFiles,
+} from './utils'
 
 function ensureSupabase() {
   if (!supabase) {
@@ -41,8 +46,77 @@ function buildDataAccessError(error, fallbackMessage) {
   return new Error(parts.join(' ').trim())
 }
 
-function mapUserName(submissionRow, fallbackId) {
-  return parseStudentNameFromFolderPath(submissionRow?.folder_path) || `Student ${fallbackId}`
+function getSubmissionPublicId(submissionRow) {
+  return String(submissionRow?.public_id || '').trim()
+}
+
+function buildSubmissionReference(submissionRow, fallbackId) {
+  return getSubmissionPublicId(submissionRow) || `Submission #${fallbackId}`
+}
+
+function mapUserName(submissionRow) {
+  return parseStudentNameFromFolderPath(submissionRow?.folder_path)
+}
+
+function buildStudentNameFromUserInfo(userInfo) {
+  const firstName = String(userInfo?.firstName || userInfo?.first || '').trim()
+  const lastName = String(userInfo?.lastName || userInfo?.last || '').trim()
+
+  return [firstName, lastName].filter(Boolean).join(' ').trim()
+}
+
+function hasEncryptedUserInfo(submissionRow) {
+  return Boolean(
+    String(submissionRow?.student_first_name_enc || '').trim() ||
+      String(submissionRow?.student_last_name_enc || '').trim() ||
+      String(submissionRow?.student_email_enc || '').trim()
+  )
+}
+
+function getStudentSubmissions(submissions = []) {
+  return submissions.filter((submission) => hasEncryptedUserInfo(submission))
+}
+
+async function loadUserInfoBySubmissionRows(submissionRows = []) {
+  const candidates = submissionRows.filter(
+    (row) => row?.submission_id && hasEncryptedUserInfo(row)
+  )
+
+  if (!candidates.length) {
+    return new Map()
+  }
+
+  try {
+    const entries = []
+
+    for (const submission of candidates) {
+      try {
+        const userInfo = await fetchDecryptedUserInfo({
+          firstName: submission.student_first_name_enc,
+          lastName: submission.student_last_name_enc,
+          email: submission.student_email_enc,
+        })
+
+        if (userInfo) {
+          entries.push([String(submission.submission_id), userInfo])
+        }
+      } catch (error) {
+        console.warn(
+          'Student names could not be loaded from the backend user info endpoint.',
+          error
+        )
+
+        if (error?.status === 404) {
+          break
+        }
+      }
+    }
+
+    return new Map(entries)
+  } catch (error) {
+    console.warn('Student names could not be loaded from the backend user info endpoint.', error)
+    return new Map()
+  }
 }
 
 function getReviewStatus(score) {
@@ -65,6 +139,15 @@ function buildRepositoryName(repositoryRow) {
     .pop()
 
   return pathName || DEFAULT_REPOSITORY_LABEL
+}
+
+function buildRepositoryOption(repositoryRow) {
+  return {
+    repositoryId: String(repositoryRow?.repository_id || ''),
+    repositoryName: buildRepositoryName(repositoryRow),
+    repositoryPath: String(repositoryRow?.repository_path || '').trim(),
+    isDefault: Boolean(repositoryRow?.is_default),
+  }
 }
 
 function hasRepositoryContent(repositoryRow) {
@@ -115,7 +198,10 @@ function mapAssignmentRun(row, assignmentRow, repositoryRow = null, repositoryRo
       ? [repositoryRow]
       : []
   const sortedRepos = sortRepositoriesForPicker(allRows)
-  const defaultRow = sortedRepos.find((r) => r.is_default) || null
+  const defaultRow =
+    sortedRepos.find((r) => hasRepositoryContent(r)) ||
+    sortedRepos.find((r) => r.is_default) ||
+    null
 
   return {
     assignment_run_id: row.assignment_run_id,
@@ -137,7 +223,8 @@ function mapAssignmentRun(row, assignmentRow, repositoryRow = null, repositoryRo
     has_repository: hasRepositoryContent(repositoryRow),
     repositories: sortedRepos.map((r) => ({
       repository_id: r.repository_id,
-      repository_name: r.repository_name,
+      repository_name: buildRepositoryName(r),
+      repository_path: r.repository_path ?? '',
       is_default: Boolean(r.is_default),
       created_at: r.created_at,
     })),
@@ -278,8 +365,8 @@ function buildRepositoryLabel(submissionRow) {
   return submissionRow?.repository_id ? DEFAULT_REPOSITORY_LABEL : 'Code File'
 }
 
-function buildSourceLabel(submissionRow, submissionId) {
-  const studentName = mapUserName(submissionRow, submissionId)
+function buildSourceLabel(submissionRow, submissionId, userInfo = null) {
+  const studentName = buildStudentNameFromUserInfo(userInfo) || mapUserName(submissionRow, submissionId)
   return studentName ? `${studentName} (Submission #${submissionId})` : `Submission #${submissionId}`
 }
 
@@ -348,36 +435,181 @@ function hasRenderableSourceExtension(fileName) {
   )
 }
 
-async function extractTextFromZipBlob(blob) {
-  const zip = await JSZip.loadAsync(blob)
-  const archiveFiles = Object.values(zip.files).filter((entry) => !entry.dir)
+function normalizeArchiveEntryName(value) {
+  return String(value || '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/^\/+/, '')
+    .replace(/\/+/g, '/')
+}
 
-  if (!archiveFiles.length) {
+function isZipArchivePath(fileName) {
+  return String(fileName || '').toLowerCase().endsWith('.zip')
+}
+
+function getRenderableExtension(fileName) {
+  const normalized = String(fileName || '').toLowerCase()
+  return Array.from(RENDERABLE_SOURCE_EXTENSIONS).find((extension) =>
+    normalized.endsWith(extension)
+  ) || ''
+}
+
+function getSubmissionCanonicalLabel(label) {
+  const normalizedLabel = normalizeArchiveEntryName(label)
+  const submissionMatch = normalizedLabel.match(/submission\s*0*(\d+)/i)
+
+  if (!submissionMatch?.[1]) {
     return ''
   }
 
-  const preferredFiles = archiveFiles.filter((entry) => hasRenderableSourceExtension(entry.name))
-  const candidateFiles = (preferredFiles.length ? preferredFiles : archiveFiles)
-    .sort((left, right) => left.name.localeCompare(right.name))
-    .slice(0, 12)
+  const extension = getRenderableExtension(normalizedLabel)
+  if (!extension) {
+    return ''
+  }
 
+  const number = submissionMatch[1].padStart(2, '0')
+  return `Submission${number}${extension}`
+}
+
+function scoreCanonicalSourceCandidate(file, canonicalLabel) {
+  const label = normalizeArchiveEntryName(file.label)
+  const fileName = getFileNameFromPath(label)
+  let score = 0
+
+  if (fileName.toLowerCase() === canonicalLabel.toLowerCase()) score += 1000
+  if (!label.toLowerCase().includes('.zip.')) score += 100
+  if (!/[0-9a-f]{8}-[0-9a-f-]{20,}/i.test(label)) score += 25
+
+  score -= label.split('/').length * 5
+  score -= label.length / 100
+
+  return score
+}
+
+function reduceSubmissionSourceDuplicates(files) {
+  const normalizedFiles = files
+    .map((file) => ({
+      label: normalizeArchiveEntryName(file.label),
+      text: String(file.text || '').replace(/\r\n/g, '\n'),
+    }))
+    .filter((file) => file.label && file.text.trim())
+
+  const submissionGroups = normalizedFiles.reduce((accumulator, file) => {
+    const canonicalLabel = getSubmissionCanonicalLabel(file.label)
+    if (!canonicalLabel) return accumulator
+
+    const existing = accumulator.get(canonicalLabel)
+    if (
+      !existing ||
+      scoreCanonicalSourceCandidate(file, canonicalLabel) >
+        scoreCanonicalSourceCandidate(existing, canonicalLabel)
+    ) {
+      accumulator.set(canonicalLabel, file)
+    }
+
+    return accumulator
+  }, new Map())
+
+  if (submissionGroups.size < 2) {
+    return normalizedFiles
+  }
+
+  return Array.from(submissionGroups.entries())
+    .sort(([leftLabel], [rightLabel]) => leftLabel.localeCompare(rightLabel))
+    .map(([canonicalLabel, file]) => ({
+      ...file,
+      label: canonicalLabel,
+    }))
+}
+
+function buildStructuredSourceText(files = []) {
+  const normalizedFiles = reduceSubmissionSourceDuplicates(files)
+
+  const fileNameCounts = normalizedFiles.reduce((accumulator, file) => {
+    const fileName = getFileNameFromPath(file.label)
+    accumulator.set(fileName, (accumulator.get(fileName) || 0) + 1)
+    return accumulator
+  }, new Map())
+
+  return normalizedFiles
+    .map((file) => {
+      const fileName = getFileNameFromPath(file.label)
+      const displayLabel = fileNameCounts.get(fileName) === 1 ? fileName : file.label
+      return `// File: ${displayLabel}\n${file.text}`
+    })
+    .join('\n\n')
+    .trim()
+}
+async function collectRenderableZipFiles(source, options = {}) {
+  const {
+    depth = 0,
+    fileLimit = 24,
+    prefix = '',
+  } = options
+  const zip = await JSZip.loadAsync(source)
+  const archiveFiles = Object.values(zip.files)
+    .filter((entry) => !entry.dir)
+    .sort((left, right) =>
+      normalizeArchiveEntryName(left.name).localeCompare(normalizeArchiveEntryName(right.name))
+    )
+
+  if (!archiveFiles.length || fileLimit <= 0) {
+    return []
+  }
+
+  const preferredFiles = archiveFiles.filter((entry) => {
+    const entryName = normalizeArchiveEntryName(entry.name)
+    return hasRenderableSourceExtension(entryName) || isZipArchivePath(entryName)
+  })
+  const candidateFiles = (preferredFiles.length ? preferredFiles : archiveFiles).slice(0, fileLimit)
   const renderedFiles = []
 
   for (const entry of candidateFiles) {
+    if (renderedFiles.length >= fileLimit) {
+      break
+    }
+
+    const entryName = normalizeArchiveEntryName(entry.name)
+    const entryLabel = prefix ? `${prefix}/${entryName}` : entryName
+
+    if (isZipArchivePath(entryName) && depth < 3) {
+      try {
+        const nestedArchive = await entry.async('arraybuffer')
+        const nestedFiles = await collectRenderableZipFiles(nestedArchive, {
+          depth: depth + 1,
+          fileLimit: fileLimit - renderedFiles.length,
+          prefix: entryLabel,
+        })
+
+        renderedFiles.push(...nestedFiles)
+
+        if (nestedFiles.length) {
+          continue
+        }
+      } catch {
+        // If a file only looks like a zip, fall through and try to read it as text.
+      }
+    }
+
     const text = (await entry.async('text')).replace(/\r\n/g, '\n')
 
-    if (looksBinaryContent(entry.name, text)) {
+    if (looksBinaryContent(entryLabel, text)) {
       continue
     }
 
-    renderedFiles.push(
-      candidateFiles.length > 1 ? `// File: ${entry.name}\n${text}` : text
-    )
+    renderedFiles.push({
+      label: entryLabel,
+      text,
+    })
   }
 
-  return renderedFiles.join('\n\n').trim()
+  return renderedFiles
 }
 
+async function extractTextFromZipBlob(blob) {
+  const renderedFiles = await collectRenderableZipFiles(blob)
+  return buildStructuredSourceText(renderedFiles)
+}
 function looksBinaryContent(objectPath, text) {
   if (!text) return true
   if (String(objectPath || '').toLowerCase().endsWith('.bin')) return true
@@ -386,10 +618,7 @@ function looksBinaryContent(objectPath, text) {
 }
 
 function normalizeStoragePath(objectPath) {
-  return String(objectPath || '')
-    .trim()
-    .replace(/^\/+/, '')
-    .replace(/\/+/g, '/')
+  return normalizeArchiveEntryName(objectPath)
 }
 
 function getParentStoragePrefix(objectPath) {
@@ -600,6 +829,75 @@ async function readStorageText(objectPath, bucket = 'Submissions') {
   return rendered.join('\n\n').trim()
 }
 
+async function discoverStorageSourcePaths(objectPath, bucket = 'Submissions') {
+  const normalizedPath = normalizeStoragePath(objectPath)
+  const prefixesToTry = unique([
+    normalizedPath,
+    getParentStoragePrefix(normalizedPath),
+  ]).filter(Boolean)
+
+  const discovered = []
+  for (const prefix of prefixesToTry) {
+    const listed = await listStorageFilesRecursively(prefix, 4, 80, bucket)
+    if (listed.length) discovered.push(...listed)
+  }
+
+  return unique(discovered)
+    .filter((candidatePath) => {
+      const normalizedCandidate = normalizeStoragePath(candidatePath)
+      const lowerCandidate = normalizedCandidate.toLowerCase()
+      const score = buildStorageCandidateScore(normalizedCandidate, normalizedPath)
+
+      return (
+        hasRenderableSourceExtension(normalizedCandidate) ||
+        isZipArchivePath(normalizedCandidate) ||
+        lowerCandidate.includes('.zip.')
+      ) && (
+        lowerCandidate.startsWith(normalizedPath.toLowerCase()) ||
+        score >= 20
+      )
+    })
+    .sort((left, right) => left.localeCompare(right))
+}
+
+async function readStorageSourceText(objectPath, bucket = 'Submissions') {
+  if (!objectPath) return ''
+
+  const normalizedPath = normalizeStoragePath(objectPath)
+  const directDownload = await supabase.storage.from(bucket).download(normalizedPath)
+
+  if (!directDownload.error && directDownload.data) {
+    const directText = await blobToRenderableText(directDownload.data, normalizedPath)
+    const directFiles = parseStructuredSourceFiles(directText, getFileNameFromPath(normalizedPath))
+
+    if (directFiles.length > 1) {
+      return buildStructuredSourceText(directFiles)
+    }
+  }
+
+  const candidates = await discoverStorageSourcePaths(objectPath, bucket)
+  const rendered = []
+
+  for (const candidatePath of candidates.slice(0, 40)) {
+    const { data: blob } = await supabase.storage.from(bucket).download(candidatePath)
+    if (!blob) continue
+
+    const text = await blobToRenderableText(blob, candidatePath)
+    if (!text) continue
+
+    if (text.trim().startsWith('// File:')) {
+      rendered.push(...parseStructuredSourceFiles(text, getFileNameFromPath(candidatePath)))
+      continue
+    }
+
+    rendered.push({
+      label: getFileNameFromPath(candidatePath),
+      text,
+    })
+  }
+
+  return rendered.length ? buildStructuredSourceText(rendered) : readStorageText(objectPath, bucket)
+}
 function parseStoredSections(text) {
   const normalizedText = String(text || '').trim()
 
@@ -852,7 +1150,7 @@ async function loadCourseSubmissionDataset(courseId) {
 
   const { data: submissionRows, error: submissionsError } = await supabase
     .from('submissions')
-    .select('submission_id, created_at, repository_id, folder_path')
+    .select('submission_id, public_id, student_first_name_enc, student_last_name_enc, student_email_enc, created_at, repository_id, folder_path')
     .in('repository_id', repositoryIds)
     .order('created_at', { ascending: false })
 
@@ -871,7 +1169,7 @@ async function loadSubmissionsByIds(submissionIds) {
 
   const { data, error } = await supabase
     .from('submissions')
-    .select('submission_id, created_at, repository_id, folder_path')
+    .select('submission_id, public_id, student_first_name_enc, student_last_name_enc, student_email_enc, created_at, repository_id, folder_path')
     .in('submission_id', submissionIds)
 
   if (error) throw error
@@ -1367,15 +1665,16 @@ export async function fetchReviewQueue(courseId) {
     ensureSupabase()
 
     const { assignmentMap, repositoriesMap, submissions } = await loadCourseSubmissionDataset(courseId)
+    const studentSubmissions = getStudentSubmissions(submissions)
 
-    if (!submissions.length) {
+    if (!studentSubmissions.length) {
       return { submissions: [] }
     }
     let resultsMap = new Map()
 
     try {
       resultsMap = await loadResultsBySubmissionIds(
-        unique(submissions.map((row) => row.submission_id))
+        unique(studentSubmissions.map((row) => row.submission_id))
       )
     } catch (resultsError) {
       console.warn(
@@ -1384,10 +1683,13 @@ export async function fetchReviewQueue(courseId) {
       )
     }
 
+    const userInfoMap = await loadUserInfoBySubmissionRows(studentSubmissions)
+
     return {
-      submissions: submissions.map((submission) => {
+      submissions: studentSubmissions.map((submission) => {
         const repository = repositoriesMap.get(String(submission.repository_id))
         const assignment = assignmentMap.get(String(repository?.assignment_run_id))
+        const userInfo = userInfoMap.get(String(submission.submission_id))
         const bestResult = pickBestResult(resultsMap.get(String(submission.submission_id)) || [])
         const similarityScore = Number.isFinite(Number(bestResult?.score))
           ? Number(bestResult.score)
@@ -1395,7 +1697,12 @@ export async function fetchReviewQueue(courseId) {
 
         return {
           id: submission.submission_id,
-          studentName: mapUserName(submission, submission.submission_id),
+          publicId: getSubmissionPublicId(submission),
+          submissionLabel: buildSubmissionReference(submission, submission.submission_id),
+          studentName:
+            buildStudentNameFromUserInfo(userInfo) ||
+            mapUserName(submission, submission.submission_id),
+          assignmentRunId: String(repository?.assignment_run_id || ''),
           assignmentName: assignment?.name || `Assignment #${repository?.assignment_run_id || submission.repository_id}`,
           language: assignment?.language || 'Unknown',
           similarityScore,
@@ -1423,12 +1730,13 @@ export async function fetchAnalytics(courseId) {
 
     const { assignments, assignmentMap, repositoriesMap, submissions } =
       await loadCourseSubmissionDataset(courseId)
-    const totalSubmissions = submissions.length
+    const studentSubmissions = getStudentSubmissions(submissions)
+    const totalSubmissions = studentSubmissions.length
     let resultsMap = new Map()
 
     try {
       resultsMap = await loadResultsBySubmissionIds(
-        unique(submissions.map((row) => row.submission_id))
+        unique(studentSubmissions.map((row) => row.submission_id))
       )
     } catch (resultsError) {
       console.warn(
@@ -1437,7 +1745,7 @@ export async function fetchAnalytics(courseId) {
       )
     }
 
-    const queueLikeSubmissions = submissions.map((submission) => {
+    const queueLikeSubmissions = studentSubmissions.map((submission) => {
       const repository = repositoriesMap.get(String(submission.repository_id))
       const assignment = assignmentMap.get(String(repository?.assignment_run_id))
       const bestResult = pickBestResult(resultsMap.get(String(submission.submission_id)) || [])
@@ -1447,6 +1755,8 @@ export async function fetchAnalytics(courseId) {
 
       return {
         id: submission.submission_id,
+        publicId: getSubmissionPublicId(submission),
+        submissionLabel: buildSubmissionReference(submission, submission.submission_id),
         language: assignment?.language || 'Unknown',
         similarityScore,
         status: getReviewStatus(similarityScore),
@@ -1515,6 +1825,11 @@ export async function fetchSubmissionReport(submissionId) {
       submissionResults.map((row) => getCounterpartSubmissionId(row, submissionId))
     )
     const sourceSubmissionsMap = await loadSubmissionsByIds(sourceSubmissionIds)
+    const userInfoMap = await loadUserInfoBySubmissionRows([
+      submission,
+      ...Array.from(sourceSubmissionsMap.values()),
+    ])
+    const userInfo = userInfoMap.get(String(submission.submission_id))
     const assignment = assignmentRunsMap.get(String(repository?.assignment_run_id))
     const bestScore = Number.isFinite(Number(submissionResults[0]?.score))
       ? Number(submissionResults[0].score)
@@ -1524,7 +1839,11 @@ export async function fetchSubmissionReport(submissionId) {
 
     return {
       id: submission.submission_id,
-      studentName: mapUserName(submission, submission.submission_id),
+      publicId: getSubmissionPublicId(submission),
+      submissionLabel: buildSubmissionReference(submission, submission.submission_id),
+      studentName:
+        buildStudentNameFromUserInfo(userInfo) ||
+        mapUserName(submission, submission.submission_id),
       assignmentName: assignment?.name || fallbackAssignmentName,
       language: assignment?.language || 'Unknown',
       submittedAt: formatShortTimestamp(submission.created_at),
@@ -1540,11 +1859,16 @@ export async function fetchSubmissionReport(submissionId) {
       matches: submissionResults.slice(0, 5).map((resultRow) => {
         const sourceSubmissionId = getCounterpartSubmissionId(resultRow, submissionId)
         const sourceSubmission = sourceSubmissionsMap.get(String(sourceSubmissionId))
-        const sourceLabel = buildSourceLabel(sourceSubmission, sourceSubmissionId)
+        const sourceLabel = buildSourceLabel(
+          sourceSubmission,
+          sourceSubmissionId,
+          userInfoMap.get(String(sourceSubmissionId))
+        )
 
         return {
           pairId: resultRow.pair_id,
           sourceSubmissionId,
+          sourcePublicId: getSubmissionPublicId(sourceSubmission),
           sourceLabel,
           score: Number(resultRow.score || 0),
           reason: `Stored result pair ${resultRow.pair_id} reports ${Number(
@@ -1559,9 +1883,10 @@ export async function fetchSubmissionReport(submissionId) {
   }
 }
 
-export async function fetchSubmissionComparison(submissionId, { pairId } = {}) {
+export async function fetchSubmissionComparison(submissionId, options = {}) {
   try {
     ensureSupabase()
+    const requestedPairId = String(options?.pairId || '').trim()
 
     const submissionMap = await loadSubmissionsByIds([submissionId])
     const submission = submissionMap.get(String(submissionId))
@@ -1570,17 +1895,49 @@ export async function fetchSubmissionComparison(submissionId, { pairId } = {}) {
       throw new Error('Submission not found.')
     }
 
+    const repositoriesMap = await loadRepositoriesByIds([submission.repository_id])
+    const repository = repositoriesMap.get(String(submission.repository_id))
+    const assignmentRunId = repository?.assignment_run_id || null
+    const repositoryOptionRows = Array.from(
+      (
+        await loadAllRepositoriesByAssignmentRunIds(assignmentRunId ? [assignmentRunId] : [])
+      ).values()
+    )
+      .filter((row) => hasRepositoryContent(row))
+      .sort((left, right) => {
+        if (Boolean(left.is_default) !== Boolean(right.is_default)) {
+          return left.is_default ? -1 : 1
+        }
+
+        return new Date(left.created_at || 0).getTime() - new Date(right.created_at || 0).getTime()
+      })
+    const defaultRepositoryOption =
+      pickPrimaryRepository(repositoryOptionRows) || repositoryOptionRows[0] || null
+    const repositoryOptions = repositoryOptionRows.map(buildRepositoryOption)
+
     const resultsMap = await loadResultsBySubmissionIds([submissionId])
-    const allResults = resultsMap.get(String(submissionId)) || []
-    const bestResult = pairId
-      ? allResults.find((r) => String(r.pair_id) === String(pairId)) || pickBestResult(allResults)
-      : pickBestResult(allResults)
+    const candidateResults = resultsMap.get(String(submissionId)) || []
+    const currentUserInfoMap = await loadUserInfoBySubmissionRows([submission])
+    const currentUserInfo = currentUserInfoMap.get(String(submission.submission_id))
+    const currentStudentName =
+      buildStudentNameFromUserInfo(currentUserInfo) ||
+      mapUserName(submission, submission.submission_id)
+    const bestResult =
+      candidateResults.find((row) => String(row.pair_id || '') === requestedPairId) ||
+      pickBestResult(candidateResults)
 
     if (!bestResult) {
       return {
         id: submission.submission_id,
+        publicId: getSubmissionPublicId(submission),
+        submissionLabel: buildSubmissionReference(submission, submission.submission_id),
+        studentName: currentStudentName,
+        assignmentRunId,
+        repositoryOptions,
+        defaultRepositoryId: String(defaultRepositoryOption?.repository_id || ''),
         pairId: null,
         sourceLabel: 'No stored comparison match',
+        sourcePublicId: '',
         similarityScore: null,
         analysisState: 'queued',
         leftText: '',
@@ -1599,7 +1956,12 @@ export async function fetchSubmissionComparison(submissionId, { pairId } = {}) {
     ])
 
     const sourceSubmission = sourceSubmissionMap.get(String(sourceSubmissionId))
-    const sourceLabel = buildSourceLabel(sourceSubmission, sourceSubmissionId)
+    const userInfoMap = await loadUserInfoBySubmissionRows([sourceSubmission].filter(Boolean))
+    const sourceLabel = buildSourceLabel(
+      sourceSubmission,
+      sourceSubmissionId,
+      userInfoMap.get(String(sourceSubmissionId))
+    )
     const sections = orientSectionsForSubmission(rawSections, bestResult, submissionId)
 
     const [leftText, rightText] = await Promise.all([
@@ -1619,8 +1981,15 @@ export async function fetchSubmissionComparison(submissionId, { pairId } = {}) {
 
     return {
       id: submission.submission_id,
+      publicId: getSubmissionPublicId(submission),
+      submissionLabel: buildSubmissionReference(submission, submission.submission_id),
+      studentName: currentStudentName,
+      assignmentRunId,
+      repositoryOptions,
+      defaultRepositoryId: String(defaultRepositoryOption?.repository_id || ''),
       pairId: bestResult.pair_id,
       sourceLabel,
+      sourcePublicId: getSubmissionPublicId(sourceSubmission),
       similarityScore: Number(bestResult.score || 0),
       analysisState: 'complete',
       leftText: leftText || buildPlaceholderCode('Current submission', sections, 'left'),
@@ -1635,6 +2004,76 @@ export async function fetchSubmissionComparison(submissionId, { pairId } = {}) {
   } catch (error) {
     console.warn('Falling back to demo submission comparison.', error)
     return getMockSubmissionComparison(submissionId)
+  }
+}
+
+function sanitizeRepositorySourceFiles(files = []) {
+  const normalizedFiles = files
+    .map((file) => ({
+      ...file,
+      label: normalizeArchiveEntryName(file?.label),
+      text: String(file?.text || '').replace(/\r\n/g, '\n'),
+    }))
+    .filter((file) => file.label && file.text.trim())
+
+  const reducedSubmissionFiles = reduceSubmissionSourceDuplicates(normalizedFiles)
+  const canonicalSubmissionCount = new Set(
+    reducedSubmissionFiles
+      .map((file) => getSubmissionCanonicalLabel(file.label))
+      .filter(Boolean)
+  ).size
+
+  const filesToUse =
+    canonicalSubmissionCount >= 2
+      ? reducedSubmissionFiles.filter((file) => getSubmissionCanonicalLabel(file.label))
+      : Array.from(
+          normalizedFiles.reduce((accumulator, file) => {
+            const key = getFileNameFromPath(file.label) || file.label
+            const existing = accumulator.get(key)
+
+            if (!existing || String(file.text || '').trim().length > String(existing.text || '').trim().length) {
+              accumulator.set(key, {
+                ...file,
+                label: key,
+              })
+            }
+
+            return accumulator
+          }, new Map()).values()
+        )
+
+  return filesToUse
+    .sort((left, right) => left.label.localeCompare(right.label))
+    .map((file, index) => ({
+      ...file,
+      id: `${index + 1}:${file.label}`,
+      index,
+    }))
+}
+export async function fetchRepositoryComparisonSource(repositoryId) {
+  try {
+    ensureSupabase()
+
+    const repositoriesMap = await loadRepositoriesByIds([repositoryId])
+    const repository = repositoriesMap.get(String(repositoryId))
+
+    if (!repository) {
+      throw new Error('Repository not found.')
+    }
+
+    const repositoryName = buildRepositoryName(repository)
+    const rawText = await readStorageSourceText(repository.repository_path)
+
+    return {
+      repositoryId: String(repository.repository_id),
+      repositoryName,
+      repositoryPath: String(repository.repository_path || '').trim(),
+      rawText,
+      files: sanitizeRepositorySourceFiles(parseStructuredSourceFiles(rawText, repositoryName)),
+    }
+  } catch (error) {
+    console.error('Failed to load repository source for comparison.', error)
+    throw buildDataAccessError(error, 'Failed to load repository source for comparison.')
   }
 }
 
@@ -1663,7 +2102,7 @@ async function fetchExportData(assignmentRunId) {
 
   const { data: submissionRows, error: submissionsError } = await supabase
     .from('submissions')
-    .select('submission_id, created_at, repository_id, folder_path')
+    .select('submission_id, public_id, student_first_name_enc, student_last_name_enc, student_email_enc, created_at, repository_id, folder_path')
     .in('repository_id', repositoryIds)
     .order('created_at', { ascending: true })
 
@@ -1677,18 +2116,8 @@ async function fetchExportData(assignmentRunId) {
   return { submissions, resultsMap }
 }
 
-function buildStudentFolderName(submissionRow) {
-  const fileName = String(submissionRow?.folder_path || '').split('/').filter(Boolean).pop()
-  if (!fileName) return null
-
-  const match = fileName.match(/^([^_]+)_([^_]+)_\d+_/)
-  if (!match) return null
-
-  return `${match[1]}_${match[2]}`.toLowerCase()
-}
-
 function getFileNameFromPath(folderPath) {
-  const segments = String(folderPath || '').split('/').filter(Boolean)
+  const segments = normalizeArchiveEntryName(folderPath).split('/').filter(Boolean)
   return segments.length ? segments[segments.length - 1] : 'submission'
 }
 
